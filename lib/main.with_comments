@@ -1,0 +1,386 @@
+import 'dart:math';
+import 'dart:ui' as ui;
+
+import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
+import 'package:vector_math/vector_math_64.dart';
+
+// Welcome to the source code for Granny Turismo!
+// Please see the LICENSE file for what you can do with this (it's Apache 2).
+
+// We don't have to put these variables at the top level but I thought it might
+// help to reduce the number of spaces in the file :-)
+
+var p = Paint();
+var gImg; // Ground image.
+var aImg; // Atlas image.
+var sImg; // Sky/mountains image.
+var scImg; // Scooter spritesheet.
+var tImg; // Title screen.
+var eImg; // Endgame screen.
+var drBd; // Bytedata backing the driveable image, for fast access.
+// Current status:
+// 0 At the start screen.
+// 1 Driving around.
+// 2 Was going to be timing start, but ran out of time.
+// 3 Was going to be timing finish, but above.
+// 4 Finish screen showing.
+// 5 As above but allowing for finger lift before restarting with a second tap.
+var sta = 0;
+// Locations of sprites in the atlas image as binary data.
+// Left, top, width, height, all divided by 8 (aligned on 8-pixel boundary) to fit in one byte each.
+ByteData atlasBd;
+// Binary data of the x, y coordinate of each object on the ground plane, sorted by lowest y first
+// and copied 360 times.  There is a sorted version for each degree of rotation, so that we always
+// draw the furthest objects first.  There is no depth buffer, so Painters' Algorithm it is.
+ByteData locationBd;
+// What OpenGL would call the modelView matrix, the inverse of the camera position.
+Matrix4 mv;
+// The modelView matrix multiplied by the projection matrix.
+Matrix4 mvp;
+// Scooter x position.
+double cx = 159;
+// Scooter z position.  After transformation, the ground lies in the xz plane, so seems to make more sense.
+double cz = -168;
+// The azimuth (rotation around the vertical axis) of the camera.
+double ca = 0;
+// The offset azimuth of the scooter relative to the camera.
+double cao;
+double cvx = 0; // Scooter x velocity.
+double cvz = 0; // Scooter z velocity.
+double cav = 0; // Scooter angular velocity.
+bool dn = false; // Is the player touching the screen?
+
+void down(PointerDownEvent e) {
+  dn = true;
+  if (sta == 4) {
+    // If we are at the end, begin a touch to restart.
+    sta = 5;
+  }
+}
+
+void move(PointerMoveEvent e) {
+  // Change the rotation of the scooter with horizontal drag.
+  cav -= e.delta.dx * 0.0007;
+  // Actually I don't think these bounds are met.
+  if (cav > 0.6) {
+    cav = 0.6;
+  } else if (cav < -0.6) {
+    cav = -0.6;
+  }
+}
+
+void up(PointerUpEvent e) {
+  dn = false;
+  if (sta == 0) {
+    // Start riding.
+    sta = 1;
+  }
+  if (sta == 5) {
+    // Restart.
+    sta = 1;
+    cx = 159;
+    cz = -168;
+    ca = 0;
+    cvx = 0;
+    cvz = 0;
+    cav = 0;
+  }
+}
+
+void main() {
+  // Portrait mode only.
+  SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp])
+      .then((_) {
+    runApp(MyApp());
+  });
+}
+
+class MyApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Listener(
+        // Listen for touch events.
+        onPointerDown: down,
+        onPointerMove: move,
+        onPointerUp: up,
+        // Draw the screen in a CustomPaint widget.
+        child: CustomPaint(painter: BlitPainter()));
+  }
+}
+
+class BlitPainter extends CustomPainter {
+  // If we trigger a redraw with RepaintListenable, we don't have to rebuild the widget tree.
+  // Apparently the most efficient redraw.
+  BlitPainter() : super(repaint: RepaintListenable()) {
+    p
+      ..strokeWidth = 15.0 // Probably just for debugging at the beginning.
+      ..filterQuality = FilterQuality.none // No bitmap filtering (mipmapping).
+      ..isAntiAlias = false // No other filtering.
+      // Debugging, could have removed I think.
+      ..color = Color.fromARGB(255, 255, 0, 0);
+    // Load all the images in the background.  Really like the async syntax in Dart.
+    // Could have chained all these, then..then..then and just tested the last one for null later.
+    _loadImage("assets/ground.png").then((i) {
+      gImg = i;
+    });
+    _loadImage("assets/atlas.png").then((i) {
+      aImg = i;
+    });
+    _loadImage("assets/sky.png").then((i) {
+      sImg = i;
+    });
+    _loadImage("assets/scooter_sheet.png").then((i) {
+      scImg = i;
+    });
+    _loadImage("assets/title.png").then((i) {
+      tImg = i;
+    });
+    _loadImage("assets/endgame.png").then((i) {
+      eImg = i;
+    });
+    _loadImage("assets/driveable.png").then((i) {
+      i.toByteData().then((bd) {
+        drBd = bd;
+      });
+    });
+    // Load binary data for the locations of sprites in the atlas.
+    rootBundle.load("assets/atlas_info.bin").then((bd) {
+      atlasBd = bd;
+    });
+    // Load binary data for the locations of sprites in the world (xz plane).
+    rootBundle.load("assets/location_info.bin").then((bd) {
+      locationBd = bd;
+    });
+  }
+
+  @override
+  void paint(Canvas c, Size s) {
+    // No point in trying to draw anything if we don't have the images and data yet.
+    if (gImg == null ||
+        aImg == null ||
+        sImg == null ||
+        scImg == null ||
+        tImg == null ||
+        drBd == null ||
+        atlasBd == null ||
+        locationBd == null) {
+      return;
+    }
+    // The resultant velocity of the scooter.
+    var v = sqrt(cvx * cvx + cvz * cvz);
+    // Update the camera angle based on angular velocity.
+    ca += 2 * cav * v;
+    // If the player is touching the screen, update the x and z velocities.
+    if (dn == true && sta > 0 && sta < 4) {
+      cvx += 0.03 * sin(ca);
+      cvz += 0.03 * cos(ca);
+    } else {
+      // Add damping for the angular velocity.
+      cav *= 0.9;
+    }
+    // Damp the x and z velocities.  This also limits top speed.
+    cvx *= 0.9;
+    cvz *= 0.9;
+    // Potential new location for the scooter is (nx, nz).
+    var nx = cx + cvx;
+    var nz = cz + cvz;
+    var drv = drBd.getUint8(
+        ((204.8 - nz) * 5).round() * 2048 * 4 + ((204.8 - nx) * 5).round() * 4);
+    // If the new location is actually on the road, we allow it.
+    if (drv == 255 || sta == 0 || sta >= 4) {
+      cx = nx;
+      cz = nz;
+      // Test for crossing the finish line.
+      if (nz < -139 && nx > 105 && nx < 144 && sta < 4) {
+        sta = 4;
+      }
+    } else if (drv > 0) {
+      // Provided we are at least partly on the road, we can update the location but reduce speed
+      // according to how far off the edge of the road the scooter is.
+      cx += cvx * drv / 255;
+      cz += cvz * drv / 255;
+    }
+    // Some fiddly maths to make sure the offset for the scooter correctly
+    // deals with the 0->2*pi boundary.
+    var v0 = Vector3(cvx, 0, cvz).normalized();
+    var v1 = Vector3(sin(ca), 0, cos(ca)).normalized();
+    var vn = Vector3(0, 1, 0).normalized();
+    cao = atan2((v0.cross(v1)).dot(vn), v0.dot(v1));
+    // Reduce the offset angle to the camera gradually as the speed slows so we don't get
+    // a sudden jump at zero forward velocity.
+    if (v < 0.3) {
+      cao *= v / 0.3;
+    }
+    // The horizontal offset of the sky/mountain background.
+    // It has to move as the camera rotates.
+    var xo = -((ca + cao) / 2 / pi * 270 * 7) % 270;
+    // The source rectangle for the background.
+    var sr = Rect.fromLTRB(xo, 0, xo + 270, 540);
+    // Where we are going to put it on the screen.  Aspect ratio might not be quite right,
+    // but nobody will notice ;-)
+    var dr = Rect.fromLTRB(0, 0, s.width, s.height);
+    // Blit the background image.
+    c.drawImageRect(sImg, sr, dr, p);
+    // Calculations for the modelview matrix (inverse of camera position).
+    mv = Matrix4.identity(); // Start with the null transform.
+    mv.translate(0.0, 0.0, -10.0); // Scooter 10 units in front of camera.
+    mv.rotateY(-(ca + cao)); // Rotate camera.
+    mv.translate(cx, 10.0, cz); // Move camera to 10 units above ground.
+    mv.rotateX(pi / 2); // Rotate about X 90 degrees (to horizontal).
+    mv.scale(0.1, 0.1, 1.0); // Make things a bit smaller.
+    mv.translate(-2048.0, -2048.0, 0.0); // Origin to screen centre.
+    // Perspective transform.
+    mvp = makePerspectiveMatrix(0.01, s.width / s.height, 1, 10);
+    mvp.multiply(mv); // Multiply matrices to get the final transform.
+    mvp.leftTranslate(s.width / 2, s.height / 2, 0); // Viewport origin.
+    c.save(); // Remember the default transform of the canvas.
+    c.transform(mvp.storage); // Put the perspective transform in place.
+    c.drawImage(gImg, Offset(0, 0), p); // Draw the ground image.
+    c.restore(); // Remove the perspective transform.
+
+    // There are 360 copies of the location list, one for every angle of the camera
+    // about the vertical axis.  These are sorted, so we draw the furthest first
+    // no matter what the orientation.
+    // l is the size of the data available for one render.
+    var l = locationBd.lengthInBytes ~/ 360;
+    // Get the angle of the camera.  We need to restrict it to 0 <= a < 360.
+    var a = ((ca + cao) * 180 / pi).floor();
+    while (a < 0) {
+      a += 360;
+    }
+    while (a >= 360) {
+      a -= 360;
+    }
+    // k is the start of the location data for this camera orientation.
+    var k = a * l;
+    // There are five bytes for each object in the location data:
+    // Altas id, location x, location y (z), atlas width, atlas height.
+    for (var i = 0; i < l; i += 5) {
+      // r is the location of the object in the scene.
+      // Strictly, the location of the centre of the bottom edge on the ground plane.
+      var r = Vector4(locationBd.getUint16(k + i + 1).toDouble(),
+          locationBd.getUint16(k + i + 3).toDouble(), 0, 1);
+      // We need a copy.
+      var rr = Vector4.copy(r);
+      // Transform the location by the camera inverse only.
+      mv.transform(rr);
+      // Now we can get the distance from the camera in world coordinates.
+      // Just need to check that the fourth coordinate is one.  Should be.
+      var zw = rr.z / rr.w;
+      // Transform the location to screen coordinates.
+      mvp.transform(r);
+      // Scale by the distance from the camera (for perspective).
+      var scale = 40 / -zw;
+      // After the perspective transform, coordinate four will almost certainly not
+      // be 1.0 so we need to normalise.
+      r.scale(1 / r.w);
+      if (scale > 0) {
+        // Look up the id of this object.
+        var n = locationBd.getUint8(k + i);
+        // Get the source rectangle size in the atlas.
+        var width = atlasBd.getUint8(n * 4 + 2) * 8.0;
+        var height = atlasBd.getUint8(n * 4 + 3) * 8.0;
+        // Work out where on the screen we will blit this sprite.
+        var left = r.x - width / 2 * scale;
+        var top = r.y - (height - 2) * scale;
+        var right = left + width * scale;
+        var bottom = r.y + 2 * scale;
+        // Destination.
+        dr = Rect.fromLTRB(left, top, right, bottom);
+        c.drawImageRect(
+            aImg, // Atlas
+            // Source image in atlas.
+            Rect.fromLTWH(atlasBd.getUint8(n * 4) * 8.0,
+                atlasBd.getUint8(n * 4 + 1) * 8.0, width, height),
+            dr,
+            p);
+      }
+    }
+
+    // Decide which scooter sprite to show.
+    // xoff and yoff are coordinates of the top left corner of the sprite.
+    var xoff;
+    var yoff = 0.0;
+    var off = min((cao.abs() * 180 / pi / 5).floor(), 7);
+    xoff = off * 109.0;
+    // If the scooter faces the other way, use the lower set of sprites.
+    if (cao > 0) {
+      yoff = 120;
+    }
+    // Hacky way to find the position of the scooter on the screen.
+    var top = 1229 / 2160.0 * s.height;
+    var bottom = 1804 / 2160.0 * s.height;
+    var left = s.width / 2 - (bottom - top) * 109 / 120 / 2;
+    var right = s.width / 2 + (bottom - top) * 109 / 120 / 2;
+    dr = Rect.fromLTRB(left, top, right, bottom);
+    // Draw the scooter over everything else and hope nobody notices.
+    // Would have done a better job but ran out of time.
+    c.drawImageRect(
+        scImg, Rect.fromLTRB(xoff, yoff, 109 + xoff, 120 + yoff), dr, p);
+    if (sta == 0) {
+      // Draw the start screen if we are at the beginning.
+      c.drawImageRect(
+          tImg,
+          Rect.fromLTRB(0, 0, 224, 336),
+          Rect.fromLTWH(0, (s.height - s.width * 336 / 224) / 2, s.width,
+              s.width * 336 / 224),
+          p);
+    }
+    if (sta >= 4) {
+      // Draw the endgame screen if we have crossed the finish line.
+      c.drawImageRect(
+          eImg,
+          Rect.fromLTRB(0, 0, 224, 199),
+          Rect.fromLTWH(0, (s.height - s.width * 336 / 199) / 2, s.width,
+              s.width * 199 / 224),
+          p);
+    }
+  }
+
+  @override
+  bool shouldRepaint(CustomPainter oldDelegate) {
+    return true; // Not sure if we need this.
+  }
+
+  // Load an asset image and return its data.
+  Future<ui.Image> _loadImage(String name) async {
+    var bd = await rootBundle.load(name);
+    var c = await ui.instantiateImageCodec(bd.buffer.asUint8List());
+    var fi = await c.getNextFrame();
+    return fi.image;
+  }
+}
+
+// Trigger a repaint on every vertical sync.
+class RepaintListenable extends Listenable {
+  VoidCallback l;
+  Ticker t; // The ticker listens for vsync.
+
+  RepaintListenable() {
+    t = Ticker(r); // Every frame, do r.
+    t.start();
+  }
+
+  // The custom painter will inject its listener callback.
+  @override
+  void addListener(lr) {
+    l = lr;
+  }
+
+  // And presumably remove it when finished.
+  @override
+  void removeListener(lr) {
+    if (l == lr) {
+      l = null;
+    }
+  }
+
+  // Causes a repaint.
+  void r(Duration duration) {
+    if (l != null) {
+      l();
+    }
+  }
+}
